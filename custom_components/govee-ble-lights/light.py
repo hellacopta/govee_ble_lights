@@ -173,6 +173,11 @@ class GoveeBluetoothLight(LightEntity):
         # a dead client and starts another one beside it.
         self._keepalive_task = None
         self._connect_task = None
+        # Serialises connection attempts. The keepalive loop and a service call can
+        # both decide the link needs rebuilding at the same moment; two concurrent
+        # establish_connection calls against one device make BlueZ answer
+        # org.bluez.Error.InProgress and ESPHome proxies burn a connection slot.
+        self._connection_lock = asyncio.Lock()
 
         # Create device info for Home Assistant
         self._attr_device_info = DeviceInfo(
@@ -825,17 +830,23 @@ class GoveeBluetoothLight(LightEntity):
         if GoveeBLE.is_usable(self._client):
             return
 
-        await self._async_drop_client()
-        try:
-            # No services cache: a wedged link's cached collection holds BlueZ
-            # object paths that no longer exist, which is what produced the
-            # UnknownObject errors in the first place.
-            self._client = await self._async_establish(use_services_cache=False)
-        except Exception as err:
-            raise HomeAssistantError(
-                f"{self.unique_id} could not be reached over BLE: {err}"
-            ) from err
-        await self._reconnect_handler()
+        async with self._connection_lock:
+            # Re-check under the lock: whoever held it may have just rebuilt the
+            # link, in which case connecting again is what causes InProgress.
+            if GoveeBLE.is_usable(self._client):
+                return
+
+            await self._async_drop_client()
+            try:
+                # No services cache: a wedged link's cached collection holds BlueZ
+                # object paths that no longer exist, which is what produced the
+                # UnknownObject errors in the first place.
+                self._client = await self._async_establish(use_services_cache=False)
+            except Exception as err:
+                raise HomeAssistantError(
+                    f"{self.unique_id} could not be reached over BLE: {err}"
+                ) from err
+            await self._reconnect_handler()
 
     async def try_connect(self) -> None:
         """
@@ -846,9 +857,11 @@ class GoveeBluetoothLight(LightEntity):
         adapter, so few or none of them ever connect.
         """
         delay = 1
-        while self._client is None:
+        while not GoveeBLE.is_usable(self._client):
             try:
-                self._client = await self._async_establish()
+                # Same locked path the keepalive and service calls use, so startup
+                # cannot race a command the user issues while we are still trying.
+                await self._async_ensure_usable()
             except Exception as err:
                 _LOGGER.debug(
                     "%s: connect failed, retrying in %ss: %s",
@@ -858,9 +871,6 @@ class GoveeBluetoothLight(LightEntity):
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, GoveeBLE.BLE_RECONNECT_MAX_BACKOFF)
-
-        # Subscribe to notifications and read back the current state.
-        await self._reconnect_handler()
 
         self._keepalive_task = self.hass.async_create_background_task(
             self._async_keepalive(), "govee_ble_keepalive"
