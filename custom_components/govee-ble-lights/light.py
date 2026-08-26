@@ -173,6 +173,12 @@ class GoveeBluetoothLight(LightEntity):
         # a dead client and starts another one beside it.
         self._keepalive_task = None
         self._connect_task = None
+        # Which scanner Home Assistant actually routed this light through. There is
+        # no other way to see this: a light stranded on a distant adapter looks
+        # identical in the UI to one on the proxy sitting next to it.
+        self._scanner_source = None
+        self._scanner_name = None
+        self._scanner_rssi = None
         # Serialises connection attempts. The keepalive loop and a service call can
         # both decide the link needs rebuilding at the same moment; two concurrent
         # establish_connection calls against one device make BlueZ answer
@@ -785,6 +791,14 @@ class GoveeBluetoothLight(LightEntity):
         except Exception as err:
             _LOGGER.debug("Reconnect handler failed: %s", err)
 
+        # Publish the route immediately; without this the attribute only appears
+        # after the device happens to send a state notification.
+        if self.hass is not None and self.entity_id:
+            try:
+                self.async_write_ha_state()
+            except Exception:
+                pass
+
     async def _async_establish(self, use_services_cache: bool = True):
         """
         Open a connection using a freshly resolved BLEDevice.
@@ -807,9 +821,59 @@ class GoveeBluetoothLight(LightEntity):
                 f"{self.unique_id} is not currently advertising to any adapter"
             )
         self._ble_device = device
+        self._resolve_scanner(device)
         return await GoveeBLE.create_connection(
             device, self.unique_id, self.hass, use_services_cache=use_services_cache
         )
+
+    def _resolve_scanner(self, device) -> None:
+        """
+        Record which adapter or proxy this connection is going through.
+
+        BLEDevice.details carries the routing. An ESPHome proxy puts the scanner's
+        MAC in details["source"]; BlueZ instead gives a D-Bus object path of the
+        form /org/bluez/hciN/dev_AA_BB_..., where the third segment is the adapter.
+        Both are best-effort: a failure here must never break a connection.
+        """
+        source = name = rssi = None
+        details = getattr(device, "details", None)
+
+        if isinstance(details, dict):
+            source = details.get("source")
+            if not source and details.get("path"):
+                parts = str(details["path"]).split("/")
+                if len(parts) > 3:
+                    source = parts[3]
+                    name = f"local adapter ({parts[3]})"
+
+        if source and not name:
+            # Ask the bluetooth manager for the friendly name of that scanner,
+            # so the attribute reads "ble-proxy-s3" rather than a bare MAC.
+            try:
+                for sd in bluetooth.async_scanner_devices_by_address(
+                    self.hass, self._mac.upper(), True
+                ):
+                    if getattr(sd.scanner, "source", None) == source:
+                        name = getattr(sd.scanner, "name", None)
+                        adv = getattr(sd, "advertisement", None)
+                        rssi = getattr(adv, "rssi", None)
+                        break
+            except Exception as err:
+                _LOGGER.debug("%s: scanner lookup failed: %s", self.unique_id, err)
+
+        self._scanner_source = source
+        self._scanner_name = name or source
+        self._scanner_rssi = rssi
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose the BLE route so a bad allocation is visible in the UI."""
+        return {
+            "ble_scanner": self._scanner_name,
+            "ble_scanner_source": self._scanner_source,
+            "ble_rssi": self._scanner_rssi,
+            "ble_address": self._mac,
+        }
 
     async def _async_drop_client(self) -> None:
         """Discard the current client so the next attempt builds a clean one."""
