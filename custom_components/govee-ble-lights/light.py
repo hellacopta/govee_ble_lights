@@ -38,9 +38,11 @@ from homeassistant.components.light import (
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers import device_registry as dr
 
 # from homeassistant.helpers.storage import Store
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 
 from .govee_ble import GoveeBLE
 from .const import DOMAIN
@@ -80,10 +82,13 @@ async def async_setup_entry(
         # Hub doesn't exist - integration not properly set up
         return
 
-    # Convert the BLE device address to a device object
+    # connectable=True: a non-connectable BLEDevice can come from a passive scanner
+    # that cannot open a link at all. __init__.py already requires True here, and the
+    # mismatch is why this platform could latch onto an unusable path. This value is
+    # only a seed -- _async_establish re-resolves before every connect.
     if hub.address is not None:
         ble_device = bluetooth.async_ble_device_from_address(
-            hass, hub.address.upper(), False
+            hass, hub.address.upper(), True
         )
         # Create and add the light entity
         async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
@@ -131,6 +136,10 @@ class GoveeBluetoothLight(LightEntity):
     # Current color mode (changes when an effect is active)
     _attr_color_mode = ColorMode.RGB
 
+    # Each config entry is exactly one light, so the entity takes its name from
+    # the device and the device name becomes the single source of truth.
+    _attr_has_entity_name = True
+
     _client = None  # BleakClient instance for BLE communication
 
     def __init__(self, hub: Hub, ble_device, config_entry: ConfigEntry) -> None:
@@ -159,11 +168,23 @@ class GoveeBluetoothLight(LightEntity):
         # Tracks whether we currently have an active notification subscription,
         # so _register_notifications can stop the old one before re-subscribing.
         self._notifications_active = False
+        # Held so async_will_remove_from_hass can cancel it. Without this, every
+        # config-entry reload leaves the previous 1s keepalive loop running against
+        # a dead client and starts another one beside it.
+        self._keepalive_task = None
+        self._connect_task = None
 
         # Create device info for Home Assistant
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._mac)},
-            name=self._model,
+            # CONNECTION_BLUETOOTH puts the MAC on the device page. The HA frontend
+            # renders "mac"/"bluetooth"/"zigbee" connections only, and links a
+            # bluetooth one through to the advertisement monitor (per-scanner RSSI),
+            # which is the view you need when a light picks the wrong adapter.
+            connections={(dr.CONNECTION_BLUETOOTH, self._mac)},
+            # The entry title is the BLE advertisement name and is unique per device.
+            # self._model is not: four of these lights are all "H617A".
+            name=config_entry.title.replace("_", " "),
             manufacturer="Govee",
             model=self._model,
         )
@@ -283,8 +304,10 @@ class GoveeBluetoothLight(LightEntity):
                 "Failed to load effect list for model %s: %s", self._model, err
             )
 
-        # Create a background task to connect to the device
-        self.hass.async_create_background_task(
+        # Create a background task to connect to the device. Tracked so unload can
+        # cancel it: try_connect loops until it succeeds, so an entity removed while
+        # still out of range would otherwise retry forever.
+        self._connect_task = self.hass.async_create_background_task(
             self.try_connect(), "govee_ble_initialize"
         )
 
@@ -309,14 +332,16 @@ class GoveeBluetoothLight(LightEntity):
         return self._current_effect
 
     @property
-    def name(self) -> str:
+    def name(self) -> str | None:
         """
         Return the name of the light entity.
 
         Returns:
-            str: "GOVEE Light" (default name for all entities)
+            None: with _attr_has_entity_name set, the entity inherits its device
+            name. Previously every entity returned the literal "GOVEE Light",
+            which is why the generated ids collided as govee_light_2..6.
         """
-        return "GOVEE Light"
+        return None
 
     @property
     def color_mode(self) -> ColorMode:
@@ -396,11 +421,9 @@ class GoveeBluetoothLight(LightEntity):
         Note: Effect is always sent before power-on so the device
         activates with the effect already loaded.
         """
-        # Ensure device is connected
-        if self._client is None:
-            raise ConnectionError(
-                "This device has not been connected yet. Is it in range?"
-            )
+        # Rebuilds the link if it is missing or wedged, rather than writing into a
+        # GATT tree that no longer exists.
+        await self._async_ensure_usable()
 
         # Send power-on first, unless we're setting an effect
         # Effect data should be loaded before activation
@@ -552,11 +575,8 @@ class GoveeBluetoothLight(LightEntity):
         The method sends a power-off command to turn the device off.
         It clears the current effect and state.
         """
-        # Ensure device is connected
-        if self._client is None:
-            raise ConnectionError(
-                "This device has not been connected yet. Is it in range?"
-            )
+        # See async_turn_on.
+        await self._async_ensure_usable()
 
         # Send power-off command
         await GoveeBLE.send_single_packet(
@@ -750,7 +770,7 @@ class GoveeBluetoothLight(LightEntity):
         """
         Re-register BLE notifications and re-request device state after a reconnect.
 
-        Called by ensure_connection() after it successfully reconnects the underlying
+        Called after every successful (re)connect by try_connect and _async_ensure_usable.
         transport. GATT subscriptions are destroyed on disconnect so this restores
         the notification channel that _process_notification depends on.
         """
@@ -760,45 +780,131 @@ class GoveeBluetoothLight(LightEntity):
         except Exception as err:
             _LOGGER.debug("Reconnect handler failed: %s", err)
 
+    async def _async_establish(self, use_services_cache: bool = True):
+        """
+        Open a connection using a freshly resolved BLEDevice.
+
+        Home Assistant re-arbitrates the best connectable scanner by RSSI as
+        advertisements arrive, so the BLEDevice must be re-read on every attempt.
+        Reusing the one captured at setup pins the light to whichever adapter saw
+        it first, so it can stay on the local adapter even when a Bluetooth proxy is
+        hearing it several dB better.
+
+        bleak_retry_connector.establish_connection takes a ble_device_callback
+        that looks made for exactly this, but it is accepted and never invoked,
+        so the re-resolve has to happen here.
+        """
+        device = bluetooth.async_ble_device_from_address(
+            self.hass, self._mac.upper(), True
+        )
+        if device is None:
+            raise HomeAssistantError(
+                f"{self.unique_id} is not currently advertising to any adapter"
+            )
+        self._ble_device = device
+        return await GoveeBLE.create_connection(
+            device, self.unique_id, self.hass, use_services_cache=use_services_cache
+        )
+
+    async def _async_drop_client(self) -> None:
+        """Discard the current client so the next attempt builds a clean one."""
+        client, self._client = self._client, None
+        self._notifications_active = False
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception as err:
+                _LOGGER.debug(
+                    "%s: disconnect while discarding client failed: %s",
+                    self.unique_id,
+                    err,
+                )
+
+    async def _async_ensure_usable(self) -> None:
+        """Guarantee the link can carry a write, rebuilding it if it cannot."""
+        if GoveeBLE.is_usable(self._client):
+            return
+
+        await self._async_drop_client()
+        try:
+            # No services cache: a wedged link's cached collection holds BlueZ
+            # object paths that no longer exist, which is what produced the
+            # UnknownObject errors in the first place.
+            self._client = await self._async_establish(use_services_cache=False)
+        except Exception as err:
+            raise HomeAssistantError(
+                f"{self.unique_id} could not be reached over BLE: {err}"
+            ) from err
+        await self._reconnect_handler()
+
     async def try_connect(self) -> None:
         """
-        Attempt to connect to the device.
+        Establish the initial connection, then keep it alive.
 
-        This method is called as a background task to establish and maintain
-        the BLE connection. It keeps retrying until successful.
-
-        Returns:
-            None
-
-        The method:
-        1. Establishes BLE connection (retries on failure)
-        2. Registers for BLE notifications
-        3. Requests initial device state
-        4. Starts background keepalive task
-
-        Note: The keepalive task created here ensures connection stability.
+        Runs as a background task. Retries with exponential backoff rather than a
+        flat 1s: several lights each retrying every second saturates a single
+        adapter, so few or none of them ever connect.
         """
-
-        # Keep trying to connect until successful
+        delay = 1
         while self._client is None:
             try:
-                # Create connection with the device
-                self._client = await GoveeBLE.create_connection(
-                    self._ble_device, self.unique_id, self.hass
+                self._client = await self._async_establish()
+            except Exception as err:
+                _LOGGER.debug(
+                    "%s: connect failed, retrying in %ss: %s",
+                    self.unique_id,
+                    delay,
+                    err,
                 )
-            except Exception:
-                # Wait before retrying
-                await asyncio.sleep(1)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, GoveeBLE.BLE_RECONNECT_MAX_BACKOFF)
 
-        # Register for BLE notifications
-        await self._register_notifications() # Register notifications which handles response of request device state
+        # Subscribe to notifications and read back the current state.
+        await self._reconnect_handler()
 
-        # Request the current device state to initialize entity
-        await self._request_device_state()
-
-        # Create a background task to keep the BLE connection active
-        # This helps remove the delay when turning on/off lights
-        self.hass.async_create_background_task(
-            GoveeBLE.ensure_connection(self._client, self._reconnect_handler),
-            "govee_ble_keepalive",
+        self._keepalive_task = self.hass.async_create_background_task(
+            self._async_keepalive(), "govee_ble_keepalive"
         )
+
+    async def _async_keepalive(self) -> None:
+        """
+        Hold the link open, rebuilding it whenever it stops being usable.
+
+        The previous version only reconnected when is_connected went false and
+        swallowed every exception with a bare continue, so a GATT-layer failure
+        was both undetectable and silent.
+        """
+        failures = 0
+        while True:
+            # Healthy links tick at BLE_KEEPALIVE_INTERVAL. A failing one backs off
+            # so an out-of-range light cannot pin the adapter with reconnect
+            # attempts -- some lights are routinely out of range.
+            await asyncio.sleep(
+                GoveeBLE.BLE_KEEPALIVE_INTERVAL
+                if not failures
+                else min(2**failures, GoveeBLE.BLE_RECONNECT_MAX_BACKOFF)
+            )
+            try:
+                await self._async_ensure_usable()
+                await GoveeBLE.send_keepalive_packet(self._client)
+                failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                failures += 1
+                _LOGGER.debug(
+                    "%s: keepalive failed (%d in a row): %s",
+                    self.unique_id,
+                    failures,
+                    err,
+                )
+                await self._async_drop_client()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel the keepalive task and close the link on unload."""
+        for task in (self._connect_task, self._keepalive_task):
+            if task is not None:
+                task.cancel()
+        self._connect_task = None
+        self._keepalive_task = None
+        await self._async_drop_client()

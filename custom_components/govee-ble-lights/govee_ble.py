@@ -130,6 +130,7 @@ class GoveeBLE:
     BLE_KEEPALIVE_INTERVAL = 1.0  # Seconds between keepalive packets
     BLE_INTERFRAME_DELAY = 0.05  # Seconds delay between frames in multi-packet
     BLE_HANDLE_RETRY = 3  # Number of connection retry attempts
+    BLE_RECONNECT_MAX_BACKOFF = 30  # Seconds; ceiling for reconnect backoff
     BLE_TIMEOUT = 7  # Timeout in seconds for operations
 
     @staticmethod
@@ -435,6 +436,36 @@ class GoveeBLE:
         return head, cmd, payload
 
     @staticmethod
+    def is_usable(client) -> bool:
+        """
+        Return True only if this link can actually carry a GATT write.
+
+        BlueZ can report Device1.Connected=true while ServicesResolved=false and the
+        whole GATT object tree is absent. Every write then fails with
+        org.freedesktop.DBus.Error.UnknownObject ("Method WriteValue ... doesn't
+        exist"), and because is_connected stays true, any recovery gated on it never
+        fires -- the light stays dead until Home Assistant restarts.
+
+        Resolving the control characteristic detects that directly: it is None
+        exactly when the tree is missing. Observed on BlueZ with a device reporting
+        Connected=yes, ServicesResolved=false and zero GattCharacteristic1 objects
+        present on the bus.
+        """
+        if client is None or not client.is_connected:
+            return False
+        try:
+            return (
+                client.services.get_characteristic(
+                    GoveeBLE.BLE_UUID_CONTROL_CHARACTERISTIC
+                )
+                is not None
+            )
+        except Exception:
+            # Some bleak backends raise rather than return an empty collection
+            # when services were never resolved.
+            return False
+
+    @staticmethod
     # Sends a single BLE data frame. log_frame indicates whether or not to log it.
     # Turn log_frame off when sending keepalive packets to prevent log spam.
     async def send_single_frame(client: BleakClient, frame, log_frame=True) -> None:
@@ -461,14 +492,10 @@ class GoveeBLE:
         Note: This method expects the frame to be pre-built with proper
         checksum. Do not call directly unless you understand the protocol.
         """
-        retry = 0
-        # Retry connection if client is not connected
-        while not client.is_connected:
-            if retry >= GoveeBLE.BLE_HANDLE_RETRY:
-                raise TimeoutError
-            await client.connect()
-            retry += 1
-
+        # Deliberately no reconnect here. Rebuilding the transport is the entity's
+        # job (_async_establish), because only it can re-resolve the BLEDevice and
+        # pick the best adapter/proxy. Calling client.connect() on a stale client
+        # reuses BlueZ object paths that may no longer exist.
         # Log the frame if logging is enabled
         if log_frame:
             _LOGGER.debug("Writing frame: %s", bytes(frame).hex())
@@ -501,19 +528,14 @@ class GoveeBLE:
         Note: This method may not work for all device models as many
         Govee BLE characteristics are write-only.
         """
-        retry = 0
-        # Retry connection if client is not connected
-        while not client.is_connected:
-            if retry >= GoveeBLE.BLE_HANDLE_RETRY:
-                raise TimeoutError
-            await client.connect()
-            retry += 1
-
+        # See send_single_frame: reconnection is the entity's job, not this layer's.
         # Read the GATT characteristic
         return await client.read_gatt_char(attribute)
 
     @staticmethod
-    async def create_connection(ble_device, identifier, hass) -> BleakClient:
+    async def create_connection(
+        ble_device, identifier, hass, use_services_cache: bool = True
+    ) -> BleakClient:
         """
         Attempts to create a connection handle for the BLE device.
 
@@ -541,72 +563,16 @@ class GoveeBLE:
 
         # Establish connection using bleak_retry_connector
         # This handles connection retries and error recovery automatically
-        client = await brc.establish_connection(
-            BleakClient, ble_device, identifier, max_attempts=GoveeBLE.BLE_HANDLE_RETRY
+        # use_services_cache=False forces a fresh GATT discovery. Pass it when
+        # recovering from a wedge, so a cached service collection full of dead
+        # BlueZ object paths cannot be handed straight back.
+        return await brc.establish_connection(
+            BleakClient,
+            ble_device,
+            identifier,
+            max_attempts=GoveeBLE.BLE_HANDLE_RETRY,
+            use_services_cache=use_services_cache,
         )
-
-        # Create a background task to keep the BLE connection active
-        # This helps remove the delay when turning on/off lights
-        return client
-
-    @staticmethod
-    async def ensure_connection(client: BleakClient, reconnect_callback=None) -> None:
-        """
-        Background task that ensures a light's BLE connection stays active.
-
-        This method is called as a background task.
-        It continuously sends keepalive packets to prevent connection drops
-        and ensures responsive light control.
-
-        Args:
-            client: BleakClient instance to keep alive
-            reconnect_callback: Optional coroutine to run after each reconnection.
-                Re-registering BLE notifications here is critical because GATT
-                subscriptions are lost when the underlying transport disconnects,
-                causing the device to appear unresponsive even though the connection
-                loop itself recovers successfully.
-
-        Returns:
-            None
-
-        The keepalive loop:
-        1. Waits 1 second (BLE_KEEPALIVE_INTERVAL)
-        2. Ensures client is connected (reconnects if needed)
-        3. Sends a keepalive packet
-        4. Continues indefinitely until stopped (homeassistant shutdown or device removed)
-
-        The try-except block prevents exceptions from stopping the loop,
-        which would cause the connection to die.
-
-        0xaa is a known documented header type to describe a keepalive packet.
-        """
-
-        # Loop forever as a background task
-        while True:
-            # Delay to avoid the loop spamming BLE packets
-            await asyncio.sleep(GoveeBLE.BLE_KEEPALIVE_INTERVAL)
-
-            # Keep inside try block to avoid the loop dying
-            try:
-                # Ensure client is connected
-                if not client.is_connected:
-                    await client.connect()
-
-                    # Re-register BLE notifications after reconnection.
-                    # GATT subscriptions are lost when the underlying transport
-                    # disconnects, so this is critical for keeping state updates flowing.
-                    if reconnect_callback is not None:
-                        try:
-                            await reconnect_callback()
-                        except Exception as cb_err:
-                            _LOGGER.debug("Reconnect callback failed: %s", cb_err)
-
-                # Send data packet to keep the connection alive
-                await GoveeBLE.send_keepalive_packet(client)
-            except Exception:
-                # Catch any exception and continue the loop
-                # This prevents crashes if connection temporarily fails
-                continue
 
     @staticmethod
     def sign_payload(data):
